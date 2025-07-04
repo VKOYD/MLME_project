@@ -1,0 +1,278 @@
+# Config
+input_cols = ['mf_PM', 'mf_TM', 'Q_g', 'w_crystal', 'c_in', 'T_PM_in', 'T_TM_in']
+output_cols = ['c', 'T_PM', 'd50', 'd90', 'd10', 'T_TM']
+input_lags = 10
+output_lags = 10
+k_folds = 5  # number of folds
+
+data_dir = r'/Users/mac/Downloads/release/Data/clustered_output/cluster_1'
+# 1. Load data
+all_data = []
+for file in sorted(os.listdir(data_dir)):
+    if file.endswith('.txt'):
+        df = pd.read_csv(os.path.join(data_dir, file), sep='\t')
+        if set(input_cols + output_cols).issubset(df.columns):
+            all_data.append(df[input_cols + output_cols])
+data = pd.concat(all_data, ignore_index=True)
+# 2. Normalize
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(data)
+
+inputs = scaled_data[:, :len(input_cols)]
+outputs = scaled_data[:, len(input_cols):]
+
+# 3. Prepare sequences for NARX
+X, y = [], []
+max_lag = max(input_lags, output_lags)
+for t in range(max_lag, len(scaled_data) - 1):
+    past_inputs = inputs[t - input_lags:t, :].flatten()
+    past_outputs = outputs[t - output_lags:t, :].flatten()
+    X.append(np.hstack([past_inputs, past_outputs]))
+    y.append(outputs[t + 1, :])
+
+X = np.array(X)
+y = np.array(y)
+
+# 4. K-Fold time series cross-validation (sequential chunks)
+n_samples = X.shape[0]
+fold_size = n_samples // k_folds
+
+print(f"Total samples: {n_samples}, Fold size: {fold_size}")
+
+# Define OPTUNA OBJECTIVE FUNCTION (BAYESIAN OPTIMIZATION)
+#Tuning for: number of layers, hidden units, batch size, epochs
+def objective(trial):
+    #Sample hyperparameters
+    num_layers = trial.suggest_int("num_layers", 1, 4)
+    hidden_dim = trial.suggest_int("hidden_dim", 32, 256, step=32)
+    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+    epochs = trial.suggest_int("epochs", 10, 60, step=10)
+
+    class NARXNet(nn.Module):
+        def __init__(self, input_dim, output_dim, hidden_dim, num_layers):
+            super(NARXNet, self).__init__()
+            layers = []
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            for _ in range(num_layers - 1):
+                layers.append(nn.Linear(hidden_dim, hidden_dim))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(hidden_dim, output_dim))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x):
+            return self.net(x)
+
+    val_losses = []
+
+    for fold in range(k_folds):
+        start = fold * fold_size
+        end = start + fold_size if fold < k_folds - 1 else n_samples
+
+        fold_X = X[start:end]
+        fold_y = y[start:end]
+
+        n_fold = fold_X.shape[0]
+        train_end = int(n_fold * 0.75)
+        val_end = train_end + int(n_fold * 0.15)
+
+        X_train_fold = fold_X[:train_end]
+        y_train_fold = fold_y[:train_end]
+
+        X_val_fold = fold_X[train_end:val_end]
+        y_val_fold = fold_y[train_end:val_end]
+
+        X_train_tensor = torch.tensor(X_train_fold, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train_fold, dtype=torch.float32)
+        X_val_tensor = torch.tensor(X_val_fold, dtype=torch.float32)
+        y_val_tensor = torch.tensor(y_val_fold, dtype=torch.float32)
+
+        input_dim = X_train_tensor.shape[1]
+        output_dim = y_train_tensor.shape[1]
+
+        model = NARXNet(input_dim, output_dim, hidden_dim, num_layers)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+        for epoch in range(epochs):
+            model.train()
+            permutation = torch.randperm(X_train_tensor.size(0))
+            epoch_loss = 0.0
+
+            for i in range(0, X_train_tensor.size(0), batch_size):
+                optimizer.zero_grad()
+                indices = permutation[i:i + batch_size]
+                batch_x = X_train_tensor[indices]
+                batch_y = y_train_tensor[indices]
+
+                outputs_pred = model(batch_x)
+                loss = criterion(outputs_pred, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * batch_x.size(0)
+
+            epoch_loss /= X_train_tensor.size(0)
+
+            #Validation loss
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val_tensor)
+                val_loss = criterion(val_pred, y_val_tensor).item()
+
+            step = fold * epochs + epoch
+            trial.report(val_loss, step)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        val_losses.append(val_loss)
+
+    avg_val_loss = np.mean(val_losses)
+    return avg_val_loss
+
+#Running Optuna optimization
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=12,timeout=3600)
+print("Best trial:")
+trial = study.best_trial
+
+print(f"Value: {trial.value}")
+print("Params:")
+for key, value in trial.params.items():
+    print(f"  {key}: {value}")
+    
+best_params = trial.params
+
+num_layers = best_params["num_layers"]
+hidden_dim = best_params["hidden_dim"]
+batch_size = best_params["batch_size"]
+epochs = best_params["epochs"]
+
+# Define model class again for each fold using best parameters
+class NARXNet(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers):
+        super(NARXNet, self).__init__()
+        layers = []
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.ReLU())
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+# To collect metrics per fold
+all_fold_metrics = []
+
+for fold in range(k_folds):
+    print(f"\n===== Fold {fold + 1}/{k_folds} =====")
+    start = fold * fold_size
+    end = start + fold_size if fold < k_folds - 1 else n_samples
+
+    fold_X = X[start:end]
+    fold_y = y[start:end]
+
+    # Split fold into train/val/test: 75% / 15% / 15%
+    n_fold = fold_X.shape[0]
+    train_end = int(n_fold * 0.75)
+    val_end = train_end + int(n_fold * 0.15)
+
+    X_train_fold = fold_X[:train_end]
+    y_train_fold = fold_y[:train_end]
+
+    X_val_fold = fold_X[train_end:val_end]
+    y_val_fold = fold_y[train_end:val_end]
+
+    X_test_fold = fold_X[val_end:]
+    y_test_fold = fold_y[val_end:]
+
+    # Convert to tensors
+    X_train_tensor = torch.tensor(X_train_fold, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train_fold, dtype=torch.float32)
+    X_val_tensor = torch.tensor(X_val_fold, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val_fold, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test_fold, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test_fold, dtype=torch.float32)
+
+    input_dim = X_train_tensor.shape[1]
+    output_dim = y_train_tensor.shape[1]
+
+    model = NARXNet(input_dim, output_dim, hidden_dim, num_layers)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    # Training loop for best parameters
+    for epoch in range(epochs):
+        model.train()
+        permutation = torch.randperm(X_train_tensor.size(0))
+        epoch_loss = 0.0
+
+        for i in range(0, X_train_tensor.size(0), batch_size):
+            optimizer.zero_grad()
+            indices = permutation[i:i + batch_size]
+            batch_x, batch_y = X_train_tensor[indices], y_train_tensor[indices]
+
+            outputs_pred = model(batch_x)
+            loss = criterion(outputs_pred, batch_y)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * batch_x.size(0)
+
+        epoch_loss /= X_train_tensor.size(0)
+
+        # Validation loss
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_val_tensor)
+            val_loss = criterion(val_pred, y_val_tensor).item()
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch {epoch + 1}/{epochs} - Train Loss: {epoch_loss:.6f} - Val Loss: {val_loss:.6f}")
+
+    # Test evaluation
+    model.eval()
+    with torch.no_grad():
+        y_test_pred = model(X_test_tensor).numpy()
+
+    # Inverse transform predicted outputs to original scale
+    last_inputs_test = X_test_fold[:, :input_lags * len(input_cols)].reshape(-1, input_lags, len(input_cols))[:, -1, :]
+    combined_pred_scaled = np.hstack([last_inputs_test, y_test_pred])
+    combined_ytest_scaled = np.hstack([last_inputs_test, y_test_fold])
+
+    predictions_original = scaler.inverse_transform(combined_pred_scaled)[:, len(input_cols):]
+    y_test_original = scaler.inverse_transform(combined_ytest_scaled)[:, len(input_cols):]
+
+    # Metrics for fold
+    fold_metrics = {}
+    print(f"\nFold {fold + 1} Test Metrics:")
+    for i, col in enumerate(output_cols):
+        mse = mean_squared_error(y_test_original[:, i], predictions_original[:, i])
+        mae = mean_absolute_error(y_test_original[:, i], predictions_original[:, i])
+        r2 = r2_score(y_test_original[:, i], predictions_original[:, i])
+        fold_metrics[col] = {'MSE': mse, 'MAE': mae, 'R2': r2}
+        print(f"{col}: MSE={mse:.2e}, MAE={mae:.2e}, R2={r2:.4f}")
+
+    all_fold_metrics.append(fold_metrics)
+
+    # Optional: Plot predictions for last fold only (or any fold)
+    if fold == k_folds - 1:
+        for i, col in enumerate(output_cols):
+            plt.figure(figsize=(10, 4))
+            plt.scatter(range(len(y_test_original[:, i])),y_test_original[:, i], label='Actual', color='orange',alpha=0.5,s=10)
+            plt.plot(predictions_original[:, i], label='Predicted', linestyle='--')
+            plt.title(f'NARXNet Prediction - {col} (Fold {fold+1})')
+            plt.xlabel('Time Step')
+            plt.ylabel(col)
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.show()
+
+# Optionally, average metrics over folds per output
+print("\nAverage Metrics Over All Folds:")
+for col in output_cols:
+    mse_avg = np.mean([fold_metrics[col]['MSE'] for fold_metrics in all_fold_metrics])
+    mae_avg = np.mean([fold_metrics[col]['MAE'] for fold_metrics in all_fold_metrics])
+    r2_avg = np.mean([fold_metrics[col]['R2'] for fold_metrics in all_fold_metrics])
+    print(f"{col}: Avg MSE={mse_avg:.2e}, Avg MAE={mae_avg:.2e}, Avg R2={r2_avg:.4f}")
