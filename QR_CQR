@@ -1,0 +1,229 @@
+**QUANTILE REGRESSORS**
+# Predict on training set
+model.eval()
+with torch.no_grad():
+    Y_train_pred_tensor = model(X_train_tensor)
+
+Y_train_pred = Y_train_pred_tensor.numpy()
+
+# Compute training error
+error = Y_train_pred - Y_train #ypred - ytrue (training set)
+# Create nice column names
+error_cols = [f"error_{col}" for col in output_cols]
+
+error_df = pd.DataFrame(error, columns=error_cols)
+
+print(error_df)
+
+n_outputs = Y_train.shape[1]
+#NARX-style model with two quantiles
+class NARX_Quantiles(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(NARX_Quantiles, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2*output_dim) #2 quantiles
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+#PinballLoss fuction
+class PinballLoss(nn.Module):
+    def __init__(self, taus,n_outputs):
+        super().__init__()
+        self.taus = taus  # list of quantiles, e.g., [0.05, 0.95]
+        self.n_outputs = n_outputs
+        
+    def forward(self, y_pred, y_true):
+        total_loss = 0
+        for j in range(self.n_outputs):
+            for i, tau in enumerate(self.taus):
+                pred_q = y_pred[:, j + i * self.n_outputs]  # lower or upper quantile
+                true_err = y_true[:, j]
+
+                diff = true_err - pred_q
+                loss = torch.where(diff >= 0,
+                                   tau * diff,
+                                   (1 - tau) * (-diff))
+                total_loss += torch.mean(loss)
+
+        total_loss /= (len(self.taus) * self.n_outputs)
+        return total_loss
+
+
+# Optionally, create DataLoader
+error_tensor = torch.tensor(error, dtype=torch.float32)
+dataset_quant = torch.utils.data.TensorDataset(X_train_tensor, error_tensor)
+loader_quant = torch.utils.data.DataLoader(dataset_quant, batch_size=64, shuffle=True)
+
+#Prepare model and training setup
+taus = [0.05, 0.95]
+model_quant = NARX_Quantiles(X_train.shape[1],n_outputs)  # past inputs and outputs
+loss_fn_quant = PinballLoss(taus, n_outputs)
+optimizer = optim.Adam(model_quant.parameters(), lr=0.01)
+
+#Training loop
+for epoch in range(n_epochs):
+    model_quant.train()
+    for xb,yb in loader_quant:
+        y_pred = model_quant(xb)              # shape: [N, 2]
+        loss = loss_fn_quant(y_pred, yb)      # y: [N, 1]
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch} | Pinball Loss: {loss.item():.4f}")
+
+#Plot results
+model_quant.eval()
+with torch.no_grad():
+    pred_errors = model_quant(X_test_tensor)
+    lower_quantiles = pred_errors[:, :n_outputs]
+    upper_quantiles= pred_errors[:,n_outputs:]
+
+#Transforming to numpy arrays
+lower_quant_np_scaled = lower_quantiles.numpy()
+upper_quant_np_scaled = upper_quantiles.numpy()
+
+#Returning to original scale
+lower_quant = lower_quant_np_scaled*std_out
+upper_quant = upper_quant_np_scaled*std_out
+
+#Computing bounds
+lower_bound = Y_pred + lower_quant
+upper_bound = Y_pred + upper_quant
+
+print("Max predicted error (upper):", np.max(upper_quant, axis=0))
+print("Max residual from base model:", np.max(np.abs(Y_pred - Y_true), axis=0))
+
+# Plot it
+plt.figure(figsize=(18, 12))
+
+for i in range(n_outputs):
+    plt.subplot(3, 2, i + 1) 
+    plt.plot(Y_true[:, i], label='True', linestyle=':', color='lightgreen')
+    plt.plot(Y_pred[:, i], label='Predicted', linestyle='-', color='lightpink')
+    plt.fill_between(
+        np.arange(len(Y_pred[:, i])),
+        lower_bound[:, i],
+        upper_bound[:, i],
+        color='blue',
+        alpha=0.3,
+        label='Prediction Interval'
+    )
+    plt.title(f'Output: {output_cols[i]}')
+    plt.xlabel('Time Step')
+    plt.ylabel(output_cols[i])
+    plt.legend()
+    plt.grid(True)
+    #Computing coverage of quantiles
+    y_true_i = Y_true[:, i]
+    lower_i = lower_bound[:, i]
+    upper_i = upper_bound[:, i]
+    
+    coverage = ((y_true_i >= lower_i) & (y_true_i <= upper_i)).mean()
+    print(f"Empirical Coverage for {output_cols[i]}: {coverage*100:.2f}%")
+plt.tight_layout()
+plt.show()
+
+**CONFORMALIZED QUANTILE REGRESSION!!!**
+# %%Conformalized Quantile Regression
+
+#Step 1: Getting the calibration data
+
+# Use the scaled training data directory
+X_calib, Y_calib = build_narx_matrices(calibration_files, scaled_calib_dir, input_cols, output_cols, o_lag, i_lag)
+print("X_calib shape:", X_calib.shape)
+print("Y_calib shape:", Y_calib.shape)
+
+# Convert to PyTorch tensors
+X_calib_tensor = torch.tensor(X_calib, dtype=torch.float32)
+Y_calib_tensor = torch.tensor(Y_calib, dtype=torch.float32)
+
+# Dataset and DataLoader
+calib_dataset = torch.utils.data.TensorDataset(X_calib_tensor, Y_calib_tensor)
+calib_loader = torch.utils.data.DataLoader(calib_dataset, batch_size=64, shuffle=True)
+
+#Step 2: Predict quantiles on calibration set
+model_quant.eval()
+with torch.no_grad():
+    pred_errors_calib = model_quant(X_calib_tensor)
+    #Transforming to numpy arrays both lower and upper quantiles
+    lower_quant_calib_scaled = pred_errors_calib[:, :n_outputs].numpy ()   
+    upper_quant_calib_scaled = pred_errors_calib[:, n_outputs:].numpy()
+
+
+#Returning to original scale
+lower_quant_calib = lower_quant_calib_scaled*std_out
+upper_quant_calib = upper_quant_calib_scaled*std_out
+
+#Step 3: Point prediction using original NARX model
+model.eval()
+with torch.no_grad():
+    Y_calib_pred_tensor = model(X_calib_tensor)
+
+#Converting to numpy and returning to original scale
+Y_calib_pred = inverse_scale(Y_calib_pred_tensor.numpy(), mean_out, std_out)
+Y_calib_true = inverse_scale(Y_calib_tensor.numpy(),mean_out,std_out)
+
+#Computing bounds
+# Bounds on calibration set
+lower_bound_calib = Y_calib_pred + lower_quant_calib #lower bound
+upper_bound_calib = Y_calib_pred + upper_quant_calib #upper bound
+
+#Step 4: Computing conformity scores
+
+calib_errors = np.maximum(
+    lower_bound_calib - Y_calib_true,
+    Y_calib_true - upper_bound_calib
+)
+calib_errors = np.maximum(calib_errors, 0)
+
+#Step 5: Computing quantile correction
+alpha = 0.1
+q_calib = np.quantile(calib_errors, 1 - alpha, axis=0)
+print("Conformal correction q_calib:", q_calib)
+
+#step 6: Applying correction on test data
+
+lower_bound_cqr = lower_bound - q_calib
+upper_bound_cqr = upper_bound + q_calib
+
+
+#Plotting
+plt.figure(figsize=(18, 12))
+
+for i in range(n_outputs):
+    plt.subplot(3, 2, i + 1)
+    plt.plot(Y_true[:, i], label='True', linestyle=':', color='lightgreen')
+    plt.plot(Y_pred[:, i], label='Predicted', linestyle='-', color='lightpink')
+    plt.fill_between(
+        np.arange(len(Y_pred[:, i])),
+        lower_bound_cqr[:, i],
+        upper_bound_cqr[:, i],
+        color='lightblue',
+        alpha=0.3,
+        label='CQR Prediction Interval'
+    )
+    plt.title(f'CQR Interval: {output_cols[i]}')
+    plt.xlabel('Time Step')
+    plt.ylabel(output_cols[i])
+    plt.legend()
+    plt.grid(True)
+
+    # Compute coverage
+    y_true_i = Y_true[:, i]
+    lower_i = lower_bound_cqr[:, i]
+    upper_i = upper_bound_cqr[:, i]
+    
+    coverage = ((y_true_i >= lower_i) & (y_true_i <= upper_i)).mean()
+    print(f"Empirical Coverage for {output_cols[i]}: {coverage*100:.2f}%")
+    
+plt.tight_layout()
+plt.show(block=True)
